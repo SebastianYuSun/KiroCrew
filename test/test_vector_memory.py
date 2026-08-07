@@ -2034,18 +2034,21 @@ class _AuditingConnection:
     transaction``. Holding ``_db_lock`` across every DML statement is what
     prevents it, so this proxy audits that discipline directly.
 
-    Reads are audited too, but only the two episodic-search fetches, which the
-    context-assembly path runs concurrently with memory writes. sqlite3 caches
-    prepared statements per connection, so a SELECT that overlaps another
-    statement can have its row iteration corrupted — that surfaced on Windows
-    CI as a NULL ``embedding`` from a query filtering ``embedding IS NOT NULL``,
-    raising ``TypeError`` on ``len()``. The other read methods are deliberately
-    NOT audited: they run unlocked by design and widening the audit to them
-    would assert an invariant this change does not establish.
+    Reads are audited too, but only the context-assembly fetches, which run
+    concurrently with memory writes: the two episodic-search fallbacks and the
+    ``get_semantic_context`` semantic fetch. sqlite3 caches prepared statements
+    per connection, so a SELECT that overlaps another statement can have its row
+    iteration corrupted — that surfaced on Windows CI as a NULL ``embedding``
+    from a query filtering ``embedding IS NOT NULL`` (``TypeError`` on ``len()``)
+    and, for the app-spawned subagent path in GitHub #1875, as
+    ``sqlite3.InterfaceError`` "bad parameter or other API misuse". The other
+    read methods are deliberately NOT audited: they run unlocked by design and
+    widening the audit to them would assert an invariant this change does not
+    establish.
     """
 
     _DML = ("INSERT", "UPDATE", "DELETE", "REPLACE", "BEGIN")
-    _GUARDED_READS = ("embedding IS NOT NULL", "text LIKE ?")
+    _GUARDED_READS = ("embedding IS NOT NULL", "text LIKE ?", "NOT LIKE 'lesson.%'")
 
     def __init__(self, inner: object, lock: _TrackingLock, violations: list[str]) -> None:
         self._inner = inner
@@ -2109,6 +2112,12 @@ class TestSharedConnectionLockDiscipline:
         # Semantic write, then an overwrite so _retire_stale_episodic runs.
         assert store.set_semantic("project.notes.findings_doc", "v1 draft", 0.9, "consolidation") is None
         assert store.set_semantic("project.notes.findings_doc", "v2 final", 0.9, "consolidation") is None
+
+        # get_semantic_context is on the same context-assembly path (memory.get_context
+        # → build_session_context). Both fetch branches (query-aware + no-query) must
+        # hold _db_lock; this is the crash site in GitHub #1875.
+        store.get_semantic_context(query_text="findings doc")
+        store.get_semantic_context()
 
         # Remaining writers: lessons (incl. embedding backfill), deletes, rotation.
         assert store.write_lesson("prefer explicit transactions over implicit ones") is True

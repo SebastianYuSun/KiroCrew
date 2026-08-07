@@ -828,10 +828,27 @@ class VectorMemoryStore:
             query_words = _stem_words(set(re.findall(r"\w+", query_text.lower())))
             query_embedding = self._try_embed(query_text) if self.embed_fn else None
 
-            all_rows = self.db.execute(
-                "SELECT key, value_json, updated_at FROM semantic_memory "
-                "WHERE is_deleted = 0 AND key NOT LIKE 'lesson.%'"
-            ).fetchall()
+            # Serialized for the same reason as the episodic search fallbacks
+            # (_sqlite_vector_search / _fts5_episodic_search): this fetch runs on
+            # the context-assembly path (build_session_context), which for an
+            # app-spawned subagent is offloaded to the mc-embed thread pool via
+            # run_in_embed_pool while memory writes (consolidation, dashboard) and
+            # other subagents' context builds run on separate threads. The store's
+            # single sqlite connection is shared across all of them, and sqlite3
+            # caches prepared statements per connection: an unsynchronized fetch
+            # overlapping another statement corrupts row iteration and surfaces as
+            # sqlite3.InterfaceError "bad parameter or other API misuse"
+            # (SQLITE_MISUSE) — the crash in GitHub #1875. check_same_thread=False
+            # only lifts the thread-affinity guard; it does NOT make concurrent use
+            # of one connection safe. Only the fetch is locked: .fetchall()
+            # materializes the rows, so the scoring loop below — which calls the
+            # blocking _try_embed — runs outside the lock (the lock must never be
+            # held across an embed; embed_fn was already called above).
+            with self._db_lock:
+                all_rows = self.db.execute(
+                    "SELECT key, value_json, updated_at FROM semantic_memory "
+                    "WHERE is_deleted = 0 AND key NOT LIKE 'lesson.%'"
+                ).fetchall()
 
             scored_rows: list[tuple[float, dict]] = []
             for r in all_rows:
@@ -868,12 +885,14 @@ class VectorMemoryStore:
             scored_rows.sort(key=lambda x: (-x[0], x[1]["updated_at"]))
             rows = [r[1] for r in scored_rows[:max_rows]]
         else:
-            # No query: recent entries
-            rows = self.db.execute(
-                "SELECT key, value_json FROM semantic_memory WHERE is_deleted = 0 "
-                "AND key NOT LIKE 'lesson.%' ORDER BY updated_at DESC LIMIT ?",
-                (max_rows,),
-            ).fetchall()
+            # No query: recent entries. Same shared-connection serialization as
+            # the query-aware branch above (see comment there).
+            with self._db_lock:
+                rows = self.db.execute(
+                    "SELECT key, value_json FROM semantic_memory WHERE is_deleted = 0 "
+                    "AND key NOT LIKE 'lesson.%' ORDER BY updated_at DESC LIMIT ?",
+                    (max_rows,),
+                ).fetchall()
 
         if not rows:
             return ""
