@@ -796,7 +796,11 @@ class TestIsReadOnlyBash:
         assert is_read_only_bash("date -u") is True
         assert is_read_only_bash("date -Iseconds") is True
         assert is_read_only_bash("date +%Y-%m-%d") is True
-        assert is_read_only_bash("date -d yesterday") is True
+        # `-d` is deliberately NOT on the accept-list: GNU `date -d` prints, BSD
+        # `date -d` sets the kernel daylight-saving value, and this ships to macOS.
+        # `--date=` is the spelling that still reads. See `_DATE_READONLY_SHORT`.
+        assert is_read_only_bash("date -d yesterday") is False
+        assert is_read_only_bash("date --date=yesterday") is True
         assert is_read_only_bash("date --date=yesterday") is True
         assert is_read_only_bash("date -r /tmp/f") is True
         assert is_read_only_bash("hostname") is True
@@ -876,11 +880,18 @@ class TestIsReadOnlyBash:
         assert is_read_only_bash("date --reference /tmp/f") is True
         assert is_read_only_bash("date --file /tmp/dates") is True
         assert is_read_only_bash("date --date=yesterday") is True
-        assert is_read_only_bash("date -d yesterday") is True
+        # `-d` is deliberately NOT on the accept-list: GNU `date -d` prints, BSD
+        # `date -d` sets the kernel daylight-saving value, and this ships to macOS.
+        # `--date=` is the spelling that still reads. See `_DATE_READONLY_SHORT`.
+        assert is_read_only_bash("date -d yesterday") is False
+        assert is_read_only_bash("date --date=yesterday") is True
         assert is_read_only_bash("date -r /tmp/f") is True
         assert is_read_only_bash("date -Iseconds") is True
         # A value-taking flag does not license a SECOND operand.
+        # Still refused, now on the FLAG rather than the operand: `-d` left the
+        # accept-list, so this no longer reaches the operand rule at all.
         assert is_read_only_bash("date -d yesterday 08221200") is False
+        assert is_read_only_bash("date --date=yesterday 08221200") is False
         assert is_read_only_bash("date --date yesterday 08221200") is False
 
     def test_an_option_looking_glob_is_refused_on_the_metacharacter_alone(self):
@@ -969,7 +980,11 @@ class TestIsReadOnlyBash:
         assert is_read_only_bash("date -Iseconds") is True
         assert is_read_only_bash("date -u") is True
         assert is_read_only_bash("date -R") is True
-        assert is_read_only_bash("date -d yesterday") is True
+        # `-d` is deliberately NOT on the accept-list: GNU `date -d` prints, BSD
+        # `date -d` sets the kernel daylight-saving value, and this ships to macOS.
+        # `--date=` is the spelling that still reads. See `_DATE_READONLY_SHORT`.
+        assert is_read_only_bash("date -d yesterday") is False
+        assert is_read_only_bash("date --date=yesterday") is True
         assert is_read_only_bash("date -r /tmp/f") is True
         assert is_read_only_bash("hostname -s") is True
         assert is_read_only_bash("hostname -f") is True
@@ -1136,7 +1151,11 @@ class TestIsReadOnlyBash:
         assert is_read_only_bash("hostname --fi=/tmp/name") is False
         assert is_read_only_bash("hostname --file=/tmp/name") is False
         # An abbreviation of a READ option is not a setter.
-        assert is_read_only_bash("date --dat=yesterday") is True
+        # An accept-list cannot honour long-option ABBREVIATIONS: an abbreviation of
+        # a read flag is indistinguishable in kind from one of a write flag, so exact
+        # match is the only rule that stays closed. The full spelling still reads.
+        assert is_read_only_bash("date --dat=yesterday") is False
+        assert is_read_only_bash("date --date=yesterday") is True
         assert is_read_only_bash("date --utc") is True
         assert is_read_only_bash("hostname --fqdn") is True
 
@@ -1255,6 +1274,90 @@ class TestIsReadOnlyBash:
     def test_empty_and_whitespace(self):
         assert is_read_only_bash("") is False
         assert is_read_only_bash("   ") is False
+
+    def test_an_unrecognised_option_prompts_instead_of_passing(self):
+        """The property a write-flag denylist cannot have: closed by construction.
+
+        A denylist admits every spelling nobody thought of. An accept-list refuses
+        them, so the failure mode moves from silent auto-approval to a prompt. These
+        are invented flags, deliberately not real ones -- the point is that the rule
+        does not depend on anyone having enumerated them.
+        """
+        for cmd in (
+            "date --not-a-real-flag",
+            "date -Z",
+            "hostname --invented",
+            "file --no-such-option x",
+            "cat f | sort --hypothetical",
+            "cat f | sort -Q",
+        ):
+            assert is_read_only_bash(cmd) is False, cmd
+        # The enumerated reads still pass, which is what makes the above a real gate
+        # rather than a blanket refusal.
+        for cmd in (
+            "date",
+            "date -u",
+            "date -Iseconds",
+            "date +%Y",
+            "date -r /tmp/f",
+            "hostname",
+            "hostname -f",
+            "file /etc/hosts",
+            "file -b /etc/hosts",
+            "cat f | sort",
+            "cat f | sort -u",
+            "cat f | sort -k1",
+        ):
+            assert is_read_only_bash(cmd) is True, cmd
+
+    def test_the_accept_list_closes_holes_the_denylist_left(self):
+        """Three shapes that pass a per-tool write-flag table and fail this one.
+
+        `file -f LIST` and `file -p` are not writes in the sense a write-flag table
+        looks for, which is why enumerating writers missed them:
+
+        * `-f/--files-from` is an INDIRECTION. The hook layer applies
+          `is_sensitive_path` to the command TEXT, so it sees `LIST` and nothing else
+          while `file` opens every path named inside it.
+        * `-p/--preserve-date` restores the access time, and restoring requires a
+          `utimes()` call whose `ctime` bump is NOT restorable. Measured on coreutils
+          8.22 with `ctime` as the observable, because `/tmp` mounts `noatime` and
+          atime therefore cannot tell "did nothing" from "put it back".
+        """
+        for cmd in (
+            "file -f LIST",
+            "file --files-from LIST",
+            "file -p /etc/hosts",
+            "file --preserve-date /etc/hosts",
+            "file -pb /etc/hosts",
+            "date -d now",
+        ):
+            assert is_read_only_bash(cmd) is False, cmd
+        # `-f` stays in the VALUE-flag set so `-f LIST` and `-fLIST` are both read as
+        # flag-plus-value and refused, rather than `LIST` being taken for an operand.
+        assert is_read_only_bash("file -fLIST") is False
+
+    def test_a_glob_still_cannot_reach_an_accept_listed_tools_flags(self):
+        """The derived glob defence has to survive the move to a positive list.
+
+        `_GLOB_SENSITIVE_WORDS` is derived from the write/exec tables, so moving a
+        tool off them dropped it out of the derivation -- measured, `cat f | sort ?uo
+        victim` went from refused to auto-approved. The registry supplies the same
+        words without a denylist: a letter that takes a value and is NOT read-only is
+        one this list refuses by construction, which for `sort` yields `-o` and `-T`.
+        """
+        for cmd in (
+            "cat f | sort ?o victim",
+            "cat f | sort ?uo victim",
+            "cat f | sort ?T /tmp",
+            "cat f | sort --out*",
+            "cat f | sort -u? victim",
+        ):
+            assert is_read_only_bash(cmd) is False, cmd
+        # A glob in OPERAND position is untouched: it has no leading dash, so it
+        # cannot resolve into an option this list decides on.
+        assert is_read_only_bash("git diff *.py") is True
+        assert is_read_only_bash("ls *.py") is True
 
 
 # ── unsafe_bash_reason — explains WHY a command is rejected ──
