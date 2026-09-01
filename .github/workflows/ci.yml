@@ -578,7 +578,13 @@ jobs:
     name: Backend Tests
     needs: [changes]
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Per arm, not per job: only 3.12 runs under coverage (see the "Run tests"
+    # step), and tracing costs about 2x wall time. Measured on this matrix, the
+    # --no-cov arm finishes in 7.7 to 13.9 minutes while the coverage arm takes
+    # 18.3 to 30.3, so one cap sized for the cheap arm cancels the expensive one
+    # at the wall while its sibling sits under half the budget. Same reasoning
+    # as the Windows job's 40, which is already higher for a smaller gap.
+    timeout-minutes: ${{ matrix.python-version == '3.12' && 45 || 30 }}
     strategy:
       # Don't cancel sibling shards when one fails -- we want the full failure
       # picture across the suite, not just the first shard to break.
